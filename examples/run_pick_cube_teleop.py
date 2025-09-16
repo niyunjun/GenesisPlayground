@@ -61,6 +61,7 @@ def main() -> None:
         print("   1. Press 'r' to start recording (anytime)")
         print("   2. Move robot with arrow keys, n/m, space")
         print("   3. Press 'r' again to stop recording and save")
+        print("   4. Press 'p' to record end effector absolute pose and relative pose to cube")
         print("   💡 Recording works from any state now!")
         print("=" * 50)
 

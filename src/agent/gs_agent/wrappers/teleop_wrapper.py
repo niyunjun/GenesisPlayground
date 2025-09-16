@@ -1,3 +1,4 @@
+import json
 import os
 import pickle
 import threading
@@ -14,6 +15,10 @@ from gs_agent.bases.env_wrapper import BaseEnvWrapper
 # Constants for trajectory management
 TRAJECTORY_DIR = "trajectories"
 TRAJECTORY_FILE_EXTENSION = ".pkl"
+
+# Constants for recording pose of end effector
+POSE_RECORD_DIR = "pose_records"
+POSE_RECORD_FILE_EXTENSION = ".json"
 
 # Type alias for trajectory step data
 TrajectoryStep = dict[str, Any]
@@ -79,6 +84,7 @@ class KeyboardWrapper(BaseEnvWrapper):
         rotation_speed: float = _DEFAULT_ROTATION_SPEED,
         replay_steps_per_command: int = 3,
         trajectory_filename_prefix: str = "franka_pick_place_",
+        pose_record_filename_prefix: str = "pose_record_",
     ) -> None:
         super().__init__(env, device)
 
@@ -91,6 +97,9 @@ class KeyboardWrapper(BaseEnvWrapper):
 
         # Trajectory management
         self.trajectory_filename_prefix = trajectory_filename_prefix
+
+        # Pose record management
+        self.pose_record_filename_prefix = pose_record_filename_prefix
 
         # Keyboard state
         self.pressed_keys = set()
@@ -160,6 +169,7 @@ class KeyboardWrapper(BaseEnvWrapper):
         print("u - Reset Scene")
         print("space - Press to close gripper, release to open gripper")
         print("r - Start/Stop Recording Trajectory")
+        print("p - Record end effector absolute pose and relative pose to cube")
         print("esc - Quit")
 
     def stop(self) -> None:
@@ -273,7 +283,6 @@ class KeyboardWrapper(BaseEnvWrapper):
             elif key == keyboard.KeyCode.from_char("j"):
                 # keep the end effector vertical down, only change the rotation around the x axis
                 current_rotation = R.from_quat(self.target_orientation[0, :].cpu().numpy())
-                # get the current x axis rotation angle
                 current_euler = current_rotation.as_euler("xyz", degrees=False)
                 # only change the x axis rotation angle
                 new_euler = [current_euler[0] + drot, current_euler[1], current_euler[2]]
@@ -283,7 +292,9 @@ class KeyboardWrapper(BaseEnvWrapper):
                 )
             elif key == keyboard.KeyCode.from_char("k"):
                 # keep the end effector vertical down, only change the rotation around the x axis
-                current_rotation = R.from_quat(self.target_orientation[0, :].cpu().numpy())
+                current_rotation = R.from_quat(
+                    self.target_orientation[0, :].cpu().numpy()
+                )  # convert (w,x,y,z) to (x,y,z,w)
                 # get the current x axis rotation angle
                 current_euler = current_rotation.as_euler("xyz", degrees=False)
                 # only change the x axis rotation angle
@@ -315,6 +326,68 @@ class KeyboardWrapper(BaseEnvWrapper):
                 self.record_requested = True
             if key == keyboard.KeyCode.from_char("u"):
                 self.reset_requested = True
+            if key == keyboard.KeyCode.from_char("p"):
+                self._save_pose_record()
+
+    def _save_pose_record(self) -> None:
+        # record end effector absolute pose and relative pose to cube
+        print("absolute position: ", self.target_position[0, :])
+        print("absolute orientation: ", self.target_orientation[0, :])
+        print(
+            "relative position: ", self.target_position[0, :] - self._env.entities["cube"].get_pos()
+        )
+        print(
+            "relative orientation: ",
+            self.target_orientation[0, :] - self._env.entities["cube"].get_quat(),
+        )
+
+        abs_target_pos = self.target_position[0, :].cpu().numpy()
+        abs_cube_pos = self._env.entities["cube"].get_pos()[0, :].cpu().numpy()
+        abs_target_quat = self.target_orientation[0, :].cpu().numpy()
+        ## convert（w,x,y,z）to (x,y,z,w)
+        abs_target_quat = R.from_quat(
+            [abs_target_quat[1], abs_target_quat[2], abs_target_quat[3], abs_target_quat[0]]
+        )
+
+        abs_cube_quat = self._env.entities["cube"].get_quat()[0, :].cpu().numpy()
+        ## convert（w,x,y,z）to (x,y,z,w)
+        abs_cube_quat = R.from_quat(
+            [abs_cube_quat[1], abs_cube_quat[2], abs_cube_quat[3], abs_cube_quat[0]]
+        )
+
+        ## calculate rel_target_quat = abs_target_quat^{-1} * abs_cube_quat
+        rel_target_quat = abs_target_quat.inv() * abs_cube_quat
+        ## convert (x,y,z,w) to (w,x,y,z)
+        rel_target_quat = rel_target_quat.as_quat()
+        rel_target_quat = R.from_quat(
+            [rel_target_quat[1], rel_target_quat[2], rel_target_quat[3], rel_target_quat[0]]
+        )
+
+        # calculate rel_target_pos = abs_target_quat^{-1} * (abs_target_pos - abs_cube_pos)
+        rel_target_pos = abs_target_quat.inv().apply(abs_target_pos - abs_cube_pos)
+
+        self.pose_record_data: dict[str, Any] = {
+            "absolute_position": abs_target_pos.astype(np.float64),
+            "absolute_orientation": abs_target_quat.as_quat().astype(np.float64),
+            "relative_orientation": rel_target_quat.as_quat().astype(np.float64),
+            "relative_position": rel_target_pos.astype(np.float64),
+        }
+
+        # save to file
+        os.makedirs(POSE_RECORD_DIR, exist_ok=True)
+        timestamp = int(time.time())
+        filename = f"{self.pose_record_filename_prefix}{timestamp}{POSE_RECORD_FILE_EXTENSION}"
+        filepath = os.path.join(POSE_RECORD_DIR, filename)
+
+        def np_convert(o: Any) -> Any:
+            if isinstance(o, np.ndarray):
+                return o.tolist()
+            if isinstance(o, (np.float32 | np.float64)):
+                return float(o)
+            return o
+
+        with open(filepath, "w") as f:
+            json.dump(self.pose_record_data, f, indent=4, default=np_convert)
 
     # Required properties for BaseEnvWrapper
     @property
