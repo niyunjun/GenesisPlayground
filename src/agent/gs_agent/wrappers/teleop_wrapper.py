@@ -11,6 +11,7 @@ from pynput import keyboard
 from scipy.spatial.transform import Rotation as R
 
 from gs_agent.bases.env_wrapper import BaseEnvWrapper
+from gs_env.common.utils.math_utils import quat_to_rotmat, quat_mul, quat_inv, normalize
 
 # Constants for trajectory management
 TRAJECTORY_DIR = "trajectories"
@@ -267,6 +268,20 @@ class KeyboardWrapper(BaseEnvWrapper):
         is_close_gripper = False
         dpos = 0.005
         drot = 0.01
+        def ee_rotation_around_z(drot: float) -> None:
+            current_rotation = R.from_quat(np.array(
+                [self.target_orientation[0, 1], 
+                 self.target_orientation[0, 2], 
+                 self.target_orientation[0, 3], 
+                 self.target_orientation[0, 0]])
+            )
+            new_euler = R.from_euler("z", drot) * current_rotation
+
+            quat_wxyz = new_euler.as_quat(scalar_first=True) # scalar first
+            self.target_orientation[0, :] = torch.from_numpy(quat_wxyz).to(
+                dtype=self.target_orientation.dtype,
+                device=self.target_orientation.device
+            )
         for key in pressed_keys:
             if key == keyboard.Key.up:
                 self.target_position[0, 0] -= dpos
@@ -281,28 +296,9 @@ class KeyboardWrapper(BaseEnvWrapper):
             elif key == keyboard.KeyCode.from_char("m"):
                 self.target_position[0, 2] -= dpos
             elif key == keyboard.KeyCode.from_char("j"):
-                # keep the end effector vertical down, only change the rotation around the x axis
-                current_rotation = R.from_quat(self.target_orientation[0, :].cpu().numpy())
-                current_euler = current_rotation.as_euler("xyz", degrees=False)
-                # only change the x axis rotation angle
-                new_euler = [current_euler[0] + drot, current_euler[1], current_euler[2]]
-                new_rotation = R.from_euler("xyz", new_euler)
-                self.target_orientation[0, :] = torch.from_numpy(new_rotation.as_quat()).to(
-                    self.target_orientation.device
-                )
+                ee_rotation_around_z(drot)
             elif key == keyboard.KeyCode.from_char("k"):
-                # keep the end effector vertical down, only change the rotation around the x axis
-                current_rotation = R.from_quat(
-                    self.target_orientation[0, :].cpu().numpy()
-                )  # convert (w,x,y,z) to (x,y,z,w)
-                # get the current x axis rotation angle
-                current_euler = current_rotation.as_euler("xyz", degrees=False)
-                # only change the x axis rotation angle
-                new_euler = [current_euler[0] - drot, current_euler[1], current_euler[2]]
-                new_rotation = R.from_euler("xyz", new_euler)
-                self.target_orientation[0, :] = torch.from_numpy(new_rotation.as_quat()).to(
-                    self.target_orientation.device
-                )
+                ee_rotation_around_z(-drot)
             elif key == keyboard.Key.space:
                 is_close_gripper = True
 
@@ -329,48 +325,46 @@ class KeyboardWrapper(BaseEnvWrapper):
             if key == keyboard.KeyCode.from_char("p"):
                 self._save_pose_record()
 
+    def absolute_to_relative_torch(self, pA, qA, pB, qB) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        convert absolute pose to relative pose, 
+        输入: pA,pB (N,3), qA,qB (N,4) (wxyz)
+        输出: p_rel (N,3), q_rel (N,4)
+        """
+        # normalize qA and qB
+        qA = normalize(qA)
+        qB = normalize(qB)
+        # convert to rotation matrix
+        RA = quat_to_rotmat(qA)
+        RB = quat_to_rotmat(qB)
+        # p_rel = RB^T * (pA - pB)
+        p_rel = torch.bmm(RB.transpose(1,2), (pA - pB).unsqueeze(-1)).squeeze(-1)
+        # q_rel = qB^{-1} * qA
+        q_rel = quat_mul(quat_inv(qB), qA)
+        # normalize q_rel
+        return p_rel, normalize(q_rel)  
+
     def _save_pose_record(self) -> None:
         # record end effector absolute pose and relative pose to cube
-        print("absolute position: ", self.target_position[0, :])
-        print("absolute orientation: ", self.target_orientation[0, :])
-        print(
-            "relative position: ", self.target_position[0, :] - self._env.entities["cube"].get_pos()
-        )
-        print(
-            "relative orientation: ",
-            self.target_orientation[0, :] - self._env.entities["cube"].get_quat(),
-        )
 
+        rel_target_pos, rel_target_quat = self.absolute_to_relative_torch(self.target_position, self.target_orientation, 
+                                self._env.entities["cube"].get_pos(), self._env.entities["cube"].get_quat())
+        # 将torch转换为numpy
         abs_target_pos = self.target_position[0, :].cpu().numpy()
-        abs_cube_pos = self._env.entities["cube"].get_pos()[0, :].cpu().numpy()
         abs_target_quat = self.target_orientation[0, :].cpu().numpy()
-        ## convert（w,x,y,z）to (x,y,z,w)
-        abs_target_quat = R.from_quat(
-            [abs_target_quat[1], abs_target_quat[2], abs_target_quat[3], abs_target_quat[0]]
-        )
-
+        abs_cube_pos = self._env.entities["cube"].get_pos()[0, :].cpu().numpy()
         abs_cube_quat = self._env.entities["cube"].get_quat()[0, :].cpu().numpy()
-        ## convert（w,x,y,z）to (x,y,z,w)
-        abs_cube_quat = R.from_quat(
-            [abs_cube_quat[1], abs_cube_quat[2], abs_cube_quat[3], abs_cube_quat[0]]
-        )
-
-        ## calculate rel_target_quat = abs_target_quat^{-1} * abs_cube_quat
-        rel_target_quat = abs_target_quat.inv() * abs_cube_quat
-        ## convert (x,y,z,w) to (w,x,y,z)
-        rel_target_quat = rel_target_quat.as_quat()
-        rel_target_quat = R.from_quat(
-            [rel_target_quat[1], rel_target_quat[2], rel_target_quat[3], rel_target_quat[0]]
-        )
-
-        # calculate rel_target_pos = abs_target_quat^{-1} * (abs_target_pos - abs_cube_pos)
-        rel_target_pos = abs_target_quat.inv().apply(abs_target_pos - abs_cube_pos)
+        rel_target_pos = rel_target_pos[0, :].cpu().numpy()
+        rel_target_quat = rel_target_quat[0, :].cpu().numpy()
 
         self.pose_record_data: dict[str, Any] = {
             "absolute_position": abs_target_pos.astype(np.float64),
-            "absolute_orientation": abs_target_quat.as_quat().astype(np.float64),
-            "relative_orientation": rel_target_quat.as_quat().astype(np.float64),
+            "absolute_orientation": abs_target_quat.astype(np.float64),
+            "cube_absolute_pos": abs_cube_pos.astype(np.float64),
+            "cube_absolute_quat": abs_cube_quat.astype(np.float64),
             "relative_position": rel_target_pos.astype(np.float64),
+            "relative_orientation": rel_target_quat.astype(np.float64),
+
         }
 
         # save to file
